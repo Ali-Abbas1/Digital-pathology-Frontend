@@ -41,7 +41,7 @@ export default function Sidebar() {
           <span style={{ fontFamily: 'var(--font-geist-sans)' }}>Reports</span>
         </Link>
       </nav>
-      <div className="px-4 mt-6">
+      {/* <div className="px-4 mt-6">
         <h2 className="text-xl" style={{ fontFamily: 'var(--font-geist-sans)' }}>Your teams</h2>
         <div className="mt-2 flex items-center space-x-2">
           <div className="bg-gray-800 rounded-full w-6 h-6 flex items-center justify-center">
@@ -49,7 +49,7 @@ export default function Sidebar() {
           </div>
           <span style={{ fontFamily: 'var(--font-geist-sans)' }}>Sales</span>
         </div>
-      </div>
+      </div> */}
     </div>
   )
 }

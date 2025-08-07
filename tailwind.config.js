@@ -11,6 +11,11 @@ module.exports = {
       colors: {
         background: "var(--background)",
         foreground: "var(--foreground)",
+        // Add new color schemes for the dashboard
+        'dashboard': {
+          'sidebar': '#1a1f36',
+          'sidebar-hover': '#12162b',
+        }
       },
       borderRadius: {
         lg: "var(--radius)",
@@ -21,7 +26,15 @@ module.exports = {
         sans: ["var(--font-geist-sans)"],
         mono: ["var(--font-geist-mono)"],
       },
+      transitionProperty: {
+        'margin': 'margin',
+      },
+      animation: {
+        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+      },
     },
   },
-  plugins: [require("tailwindcss-animate")],
+  plugins: [
+    require("tailwindcss-animate"),
+  ],
 };

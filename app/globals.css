@@ -17,3 +17,14 @@ body {
     --radius: 0.5rem;
   }
 }
+
+.openseadragon-viewer {
+  width: 100%;
+  height: 100%;
+  background: #000;
+}
+
+.navigator {
+  background: rgba(0, 0, 0, 0.8);
+  border: 1px solid #fff;
+}

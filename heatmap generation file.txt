@@ -1,0 +1,1599 @@
+
+# -------------------------------------------------------------This code is original
+from __future__ import print_function
+
+import multiprocessing as mp
+
+import numpy as np
+
+import argparse
+import logging
+import time
+import torch
+import torch.nn as nn
+import pdb
+import os
+import pandas as pd
+from utils.utils import *
+from math import floor
+from utils.eval_utils import initiate_model as initiate_model
+from models.model_clam import CLAM_MB, CLAM_SB
+from models import get_encoder
+from types import SimpleNamespace
+from collections import namedtuple
+import h5py
+import yaml
+from wsi_core.batch_process_utils import initialize_df
+from vis_utils.heatmap_utils import initialize_wsi, drawHeatmap, compute_from_patches
+from wsi_core.wsi_utils import sample_rois
+from utils.file_utils import save_hdf5
+from tqdm import tqdm
+import traceback
+import openslide
+from wsi_core.WholeSlideImage import WholeSlideImage
+import logging
+from types import SimpleNamespace
+import sys
+import pyvips
+from PIL import Image
+
+from contextlib import contextmanager
+import signal
+import psutil
+
+
+
+def log_system_resources():
+    mem = psutil.virtual_memory()
+    gpu_mem = torch.cuda.memory_allocated()
+    logging.info(f"CPU memory: {mem.percent}%, GPU memory: {gpu_mem / 1e9:.2f}GB")
+
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+
+def load_params(df_entry, params):
+            for key in params.keys():
+                if key in df_entry.index:
+                    dtype = type(params[key])
+                    val = df_entry[key] 
+                    val = dtype(val)
+                    if isinstance(val, str):
+                        if len(val) > 0:
+                            params[key] = val
+                    elif not np.isnan(val):
+                        params[key] = val
+                    else:
+                        pdb.set_trace()
+
+            return params
+
+
+def parse_config_dict(args, config_dict):
+            if args.save_exp_code is not None:
+                config_dict['exp_arguments']['save_exp_code'] = args.save_exp_code
+            if args.overlap is not None:
+                config_dict['patching_arguments']['overlap'] = args.overlap
+            return config_dict
+
+def generate_heatmap(
+        input_slide_path: str, 
+        flask_root_dir: str, 
+        config_file='config_template.yaml',
+        production_subdir: str = 'slides/production_results',
+        raw_subdir: str = 'slides/raw_results'
+        ):
+    if __name__ == '__main__':
+        mp.set_start_method('spawn', force=True)
+    try:
+        logger.info(f"CUDA device count: {torch.cuda.device_count()}")
+        logger.info(f"Current CUDA device: {torch.cuda.current_device()}")
+        
+        torch.backends.cudnn.benchmark = True  # Optimize CUDA
+        logger.info(f"Generating heatmap in PID: {os.getpid()}")
+        logger.info(f"Active processes during heatmap generation: {len(mp.active_children())}")
+        logger.info("\n========================================")
+        logger.info("Starting CLAM Heatmap Generation Process")
+        logger.info("========================================")
+        logger.info(f"\nWaiting for input slide: {input_slide_path}")
+
+
+        torch.cuda.set_device(0)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Wait for the input file to be completely uploaded
+        while not os.path.exists(input_slide_path):
+            logger.info("Waiting for input file to be uploaded completely...")
+            time.sleep(2)  # Wait for 2 seconds before checking again
+            
+        # Check if file size is stable (upload completed)
+        last_size = -1
+        current_size = os.path.getsize(input_slide_path)
+        while last_size != current_size:
+            print("Waiting for file upload to complete...")
+            time.sleep(2)
+            last_size = current_size
+            current_size = os.path.getsize(input_slide_path)
+            
+        print(f"\nInput file detected and ready for processing: {input_slide_path}")
+        print("\nInitializing configuration...")
+        # Set up directories
+        production_save_dir = os.path.join(flask_root_dir, production_subdir)
+        raw_save_dir = os.path.join(flask_root_dir, raw_subdir)
+        os.makedirs(production_save_dir, exist_ok=True)
+        os.makedirs(raw_save_dir, exist_ok=True)
+
+        logger.info("\nLoading model configuration...")
+        # Load config
+        clam_dir = os.path.join(flask_root_dir, 'model', 'CLAM_UNI_V2_211sld')
+        config_path = os.path.join(clam_dir, 'heatmaps', 'configs', config_file)
+
+        if not os.path.exists(config_path):
+            return {
+                'status': 'error',
+                'message': f'Config file not found at {config_path}'
+            }
+
+        config_dict = yaml.safe_load(open(config_path, 'r'))
+
+        # Instead of using argparse, create a simple namespace object
+        args = SimpleNamespace()
+        args.save_exp_code = "HEATMAP_OUTPUT"
+        args.overlap = None
+        args.config_file = config_file
+        
+
+        # Set up args namespace for parse_config_dict 
+        
+        
+
+        # Parse config with our custom args
+        config_dict = parse_config_dict(args, config_dict)
+
+        
+         # OVERRIDE config with Flask paths
+        config_dict['exp_arguments']['production_save_dir'] = production_save_dir
+        config_dict['exp_arguments']['raw_save_dir'] = raw_save_dir
+        config_dict['data_arguments']['data_dir'] = os.path.dirname(input_slide_path)
+        config_dict['data_arguments']['data_slide_dir'] = os.path.dirname(input_slide_path)
+        config_dict['data_arguments']['slide_ext'] = os.path.splitext(input_slide_path)[1]
+        
+
+
+        
+        
+
+        
+        logger.info("\nConfiguration loaded. Current settings:")
+        for key, value in config_dict.items():
+            if isinstance(value, dict):
+                print(f'\n{key}:')
+                for value_key, value_value in value.items():
+                    print(f"  {value_key}: {value_value}")
+            else:
+                print(f'\n{key}: {value}')
+
+        
+        print("\nStarting processing...")
+         
+        patch_args = argparse.Namespace(**config_dict['patching_arguments'])
+        data_args = argparse.Namespace(**config_dict['data_arguments'])
+        model_args = config_dict['model_arguments']
+        model_args.update({'n_classes': config_dict['exp_arguments']['n_classes']})
+        model_args = argparse.Namespace(**model_args)
+        encoder_args = argparse.Namespace(**config_dict['encoder_arguments'])
+        exp_args = argparse.Namespace(**config_dict['exp_arguments'])
+        heatmap_args = argparse.Namespace(**config_dict['heatmap_arguments'])
+        sample_args = argparse.Namespace(**config_dict['sample_arguments'])
+
+        patch_size = tuple([patch_args.patch_size for i in range(2)])
+        step_size = tuple((np.array(patch_size) * (1 - patch_args.overlap)).astype(int))
+        print('patch_size: {} x {}, with {:.2f} overlap, step size is {} x {}'.format(patch_size[0], patch_size[1], patch_args.overlap, step_size[0], step_size[1]))
+
+        preset_name = 'bwh_biopsy.csv'
+        preset_path = os.path.join(clam_dir, 'presets', preset_name)
+        preset = preset_path
+        def_seg_params = {'seg_level': -1, 'sthresh': 15, 'mthresh': 11, 'close': 2, 'use_otsu': False, 
+                            'keep_ids': 'none', 'exclude_ids':'none'}
+        def_filter_params = {'a_t':50.0, 'a_h': 8.0, 'max_n_holes':10}
+        def_vis_params = {'vis_level': -1, 'line_thickness': 250}
+        def_patch_params = {'use_padding': True, 'contour_fn': 'four_pt'}
+
+        # Instead of reading from process_list, create a DataFrame for single slide
+        slide_name = os.path.basename(input_slide_path)
+        slides = [slide_name]
+
+        if preset is not None:
+            preset_df = pd.read_csv(preset)
+            for key in def_seg_params.keys():
+                def_seg_params[key] = preset_df.loc[0, key]
+
+            for key in def_filter_params.keys():
+                def_filter_params[key] = preset_df.loc[0, key]
+
+            for key in def_vis_params.keys():
+                def_vis_params[key] = preset_df.loc[0, key]
+
+            for key in def_patch_params.keys():
+                def_patch_params[key] = preset_df.loc[0, key]
+
+        df = initialize_df(slides, def_seg_params, def_filter_params, def_vis_params, def_patch_params, use_heatmap_args=False)
+
+        def infer_single_slide(model, features, label, reverse_label_dict, k=1):
+            features = features.to(device, non_blocking=True)
+            with torch.inference_mode():
+                if isinstance(model, (CLAM_SB, CLAM_MB)):
+                    model_results_dict = model(features)
+                    logits, Y_prob, Y_hat, A, _ = model(features)
+                    Y_hat = Y_hat.item()
+
+                    if isinstance(model, (CLAM_MB,)):
+                        A = A[Y_hat]
+
+                    A = A.view(-1, 1).cpu().numpy()
+
+                else:
+                    raise NotImplementedError
+
+                print('Y_hat: {}, Y: {}, Y_prob: {}'.format(reverse_label_dict[Y_hat], label, ["{:.4f}".format(p) for p in Y_prob.cpu().flatten()]))	
+                
+                probs, ids = torch.topk(Y_prob, k)
+                probs = probs[-1].cpu().numpy()
+                ids = ids[-1].cpu().numpy()
+                preds_str = np.array([reverse_label_dict[idx] for idx in ids])
+
+            return ids, preds_str, probs, A
+
+        
+        # Create process stack as in original code
+        mask = df['process'] == 1
+        process_stack = df[mask].reset_index(drop=True)
+        total = len(process_stack)
+        logger.info('\nlist of slides to process: ')
+        logger.info(process_stack.head(len(process_stack)))
+        logger.info('\ninitializing model from checkpoint')
+
+        logger.info(f"Total slides to process: {total}")
+        logger.info('\ninitializing model from checkpoint')
+        ckpt_path = os.path.join(clam_dir, 'heatmaps', 'demo', 'ckpts', 's_4_checkpoint.pt')
+        logger.info('\nckpt path: {}'.format(ckpt_path))
+            
+        if model_args.initiate_fn == 'initiate_model':
+            model = initiate_model(model_args, ckpt_path).to(device)
+            
+        else:
+            raise NotImplementedError
+        
+        log_system_resources()
+
+        feature_extractor, img_transforms = get_encoder(encoder_args.model_name, target_img_size=encoder_args.target_img_size)
+        _ = feature_extractor.eval()
+        feature_extractor = feature_extractor.to(device)
+        logger.info('Feature extraction Done!')
+        
+
+        label_dict =  data_args.label_dict
+        class_labels = list(label_dict.keys())
+        class_encodings = list(label_dict.values())
+        reverse_label_dict = {class_encodings[i]: class_labels[i] for i in range(len(class_labels))} 
+
+        log_system_resources()            
+
+        os.makedirs(exp_args.production_save_dir, exist_ok=True)
+        os.makedirs(exp_args.raw_save_dir, exist_ok=True)
+        blocky_wsi_kwargs = {'top_left': None, 'bot_right': None, 'patch_size': patch_size, 'step_size': patch_size, 
+        'custom_downsample':patch_args.custom_downsample, 'level': patch_args.patch_level, 'use_center_shift': heatmap_args.use_center_shift}
+
+        for i in tqdm(range(len(process_stack)), desc='Processing slide', leave=True):
+            slide_name = process_stack.loc[i, 'slide_id']
+
+            logger.info(f"\nStarting processing for slide {i+1}/{total}: {slide_name}")
+            logger.info(f"Processing slide {i+1}/{total}: {slide_name}")
+            
+            
+            if data_args.slide_ext not in slide_name:
+                slide_name+=data_args.slide_ext
+            print('\nprocessing: ', slide_name)	
+
+            try:
+                label = process_stack.loc[i, 'label']
+            except KeyError:
+                label = 'Unspecified'
+
+            slide_id = slide_name.replace(data_args.slide_ext, '')
+            config_dict['exp_arguments']['save_exp_code'] = slide_id
+
+            if not isinstance(label, str):
+                grouping = reverse_label_dict[label]
+            else:
+                grouping = label
+
+            log_system_resources()
+
+            p_slide_save_dir = os.path.join(exp_args.production_save_dir, slide_id)
+            os.makedirs(p_slide_save_dir, exist_ok=True)
+
+            r_slide_save_dir = os.path.join(exp_args.raw_save_dir, slide_id)
+            os.makedirs(r_slide_save_dir, exist_ok=True)
+
+            
+
+
+            if heatmap_args.use_roi:
+                x1, x2 = process_stack.loc[i, 'x1'], process_stack.loc[i, 'x2']
+                y1, y2 = process_stack.loc[i, 'y1'], process_stack.loc[i, 'y2']
+                top_left = (int(x1), int(y1))
+                bot_right = (int(x2), int(y2))
+            else:
+                top_left = None
+                bot_right = None
+                
+                logger.info(f'slide id: , #{slide_id}')
+                logger.info(f'top left: {top_left}, bot right: {bot_right}')
+
+            if isinstance(data_args.data_dir, str):
+                slide_path = os.path.join(data_args.data_dir, slide_name)
+            elif isinstance(data_args.data_dir, dict):
+                data_dir_key = process_stack.loc[i, data_args.data_dir_key]
+                slide_path = os.path.join(data_args.data_dir[data_dir_key], slide_name)
+            else:
+                raise NotImplementedError
+
+            mask_file = os.path.join(r_slide_save_dir, slide_id+'_mask.pkl')
+
+            log_system_resources()    
+                # Load segmentation and filter parameters
+            seg_params = def_seg_params.copy()
+            filter_params = def_filter_params.copy()
+            vis_params = def_vis_params.copy()
+
+            seg_params = load_params(process_stack.loc[i], seg_params)
+            filter_params = load_params(process_stack.loc[i], filter_params)
+            vis_params = load_params(process_stack.loc[i], vis_params)
+
+            keep_ids = str(seg_params['keep_ids'])
+            if len(keep_ids) > 0 and keep_ids != 'none':
+                seg_params['keep_ids'] = np.array(keep_ids.split(',')).astype(int)
+            else:
+                seg_params['keep_ids'] = []
+
+            exclude_ids = str(seg_params['exclude_ids'])
+            if len(exclude_ids) > 0 and exclude_ids != 'none':
+                seg_params['exclude_ids'] = np.array(exclude_ids.split(',')).astype(int)
+            else:
+                seg_params['exclude_ids'] = []
+
+            for key, val in seg_params.items():
+                print('{}: {}'.format(key, val))
+
+            for key, val in filter_params.items():
+                print('{}: {}'.format(key, val))
+
+            for key, val in vis_params.items():
+                print('{}: {}'.format(key, val))
+                
+            print('Initializing WSI object')
+            wsi_object = initialize_wsi(slide_path, seg_mask_path=mask_file, seg_params=seg_params, filter_params=filter_params)
+            print('Done!')
+            logger.info("WSI object initialized successfully")
+
+            log_system_resources()
+
+            wsi_ref_downsample = wsi_object.level_downsamples[patch_args.patch_level]
+
+            # Before feature computation
+
+                # the actual patch size for heatmap visualization should be the patch size * downsample factor * custom downsample factor
+            vis_patch_size = tuple((np.array(patch_size) * np.array(wsi_ref_downsample) * patch_args.custom_downsample).astype(int))
+
+            block_map_save_path = os.path.join(r_slide_save_dir, '{}_blockmap.h5'.format(slide_id))
+            mask_path = os.path.join(r_slide_save_dir, '{}_mask.jpg'.format(slide_id))
+            if vis_params['vis_level'] < 0:
+                best_level = wsi_object.wsi.get_best_level_for_downsample(32)
+                vis_params['vis_level'] = best_level
+            mask = wsi_object.visWSI(**vis_params, number_contours=True)
+            mask.save(mask_path)
+                
+            features_path = os.path.join(r_slide_save_dir, slide_id+'.pt')
+            h5_path = os.path.join(r_slide_save_dir, slide_id+'.h5')
+
+            log_system_resources()
+            
+
+                ##### check if h5_features_file exists ######
+            
+                      
+            if not os.path.isfile(h5_path):
+                        logger.info("Starting feature computation")
+                        _, _, wsi_object = compute_from_patches(wsi_object=wsi_object, 
+                                                            model=model, 
+                                                            feature_extractor=feature_extractor, 
+                                                            img_transforms=img_transforms,
+                                                            batch_size=exp_args.batch_size, **blocky_wsi_kwargs, 
+                                                            attn_save_path=None, feat_save_path=h5_path, 
+                                                            ref_scores=None)
+                        logger.info("Feature computation completed")
+
+            			
+                
+                ##### check if pt_features_file exists ######
+            if not os.path.isfile(features_path):
+                with h5py.File(h5_path, 'r') as file:
+                    features = torch.tensor(file['features'][:])
+                    torch.save(features, features_path)
+                    file.close()
+
+                # load features 
+            features = torch.load(features_path, map_location="cpu") # offload to CPU if GPU is full
+            process_stack.loc[i, 'bag_size'] = len(features)
+                
+            wsi_object.saveSegmentation(mask_file)
+            try:
+                Y_hats, Y_hats_str, Y_probs, A = infer_single_slide(model, features, label, reverse_label_dict, exp_args.n_classes)
+            except Exception as e:
+                logger.error(f"CUDA error during inference: {str(e)}")
+                raise
+            
+                
+            if not os.path.isfile(block_map_save_path): 
+                file = h5py.File(h5_path, "r")
+                coords = file['coords'][:]
+                
+                file.close()
+                asset_dict = {'attention_scores': A, 'coords': coords}
+                block_map_save_path = save_hdf5(block_map_save_path, asset_dict, mode='w')
+                
+                # save top 3 predictions
+            for c in range(exp_args.n_classes):
+                process_stack.loc[i, 'Pred_{}'.format(c)] = Y_hats_str[c]
+                process_stack.loc[i, 'p_{}'.format(c)] = Y_probs[c]
+
+            
+            if data_args.process_list is not None:
+                process_stack.to_csv(os.path.join(exp_args.production_save_dir, 
+                                                '{}.csv'.format(data_args.process_list.replace('.csv', ''))), 
+                                   index=False)
+            else:
+                process_stack.to_csv(os.path.join(exp_args.production_save_dir, 
+                                                '{}.csv'.format(exp_args.save_exp_code)), 
+                                   index=False)
+                
+            file = h5py.File(block_map_save_path, 'r')
+            dset = file['attention_scores']
+            coord_dset = file['coords']
+            scores = dset[:]
+            coords = coord_dset[:]
+            file.close()
+
+            samples = sample_args.samples
+            for sample in samples:
+                if sample['sample']:
+                    tag = "label_{}_pred_{}".format(label, Y_hats[0])
+                    sample_save_dir =  os.path.join(exp_args.production_save_dir, slide_id, 'sampled_patches', str(tag), sample['name'])
+                    os.makedirs(sample_save_dir, exist_ok=True)
+                    print('sampling {}'.format(sample['name']))
+                    sample_results = sample_rois(scores, coords, k=sample['k'], mode=sample['mode'], seed=sample['seed'], 
+                        score_start=sample.get('score_start', 0), score_end=sample.get('score_end', 1))
+                    for idx, (s_coord, s_score) in enumerate(zip(sample_results['sampled_coords'], sample_results['sampled_scores'])):
+                        print('coord: {} score: {:.3f}'.format(s_coord, s_score))
+                        patch = wsi_object.wsi.read_region(tuple(s_coord), patch_args.patch_level, (patch_args.patch_size, patch_args.patch_size)).convert('RGB')
+                        patch.save(os.path.join(sample_save_dir, '{}_{}_x_{}_y_{}_a_{:.3f}.png'.format(idx, slide_id, s_coord[0], s_coord[1], s_score)))
+
+            wsi_kwargs = {'top_left': top_left, 'bot_right': bot_right, 'patch_size': patch_size, 'step_size': step_size, 
+            'custom_downsample':patch_args.custom_downsample, 'level': patch_args.patch_level, 'use_center_shift': heatmap_args.use_center_shift}
+
+            heatmap_save_name = '{}_blockmap.tiff'.format(slide_id)
+            if os.path.isfile(os.path.join(r_slide_save_dir, heatmap_save_name)):
+                pass
+            else:
+                heatmap = drawHeatmap(scores, coords, slide_path, wsi_object=wsi_object, cmap=heatmap_args.cmap, alpha=heatmap_args.alpha, use_holes=True, binarize=False, vis_level=-1, blank_canvas=False,
+                                thresh=-1, patch_size = vis_patch_size, convert_to_percentiles=True)
+                
+                heatmap.save(os.path.join(r_slide_save_dir, '{}_blockmap.png'.format(slide_id)))
+                del heatmap
+
+            save_path = os.path.join(r_slide_save_dir, '{}_{}_roi_{}.h5'.format(slide_id, patch_args.overlap, heatmap_args.use_roi))
+
+            if heatmap_args.use_ref_scores:
+                    ref_scores = scores
+            else:
+                    ref_scores = None
+                
+            if heatmap_args.calc_heatmap:
+                logger.info("Starting heatmap computation")
+                compute_from_patches(wsi_object=wsi_object, 
+                                    img_transforms=img_transforms,
+                                    clam_pred=Y_hats[0], model=model, 
+                                    feature_extractor=feature_extractor, 
+                                    batch_size=exp_args.batch_size, **wsi_kwargs, 
+                                    attn_save_path=save_path,  ref_scores=ref_scores)
+                logger.info("Heatmap computation completed")
+
+            if not os.path.isfile(save_path):
+                    print('heatmap {} not found'.format(save_path))
+                    if heatmap_args.use_roi:
+                        save_path_full = os.path.join(r_slide_save_dir, '{}_{}_roi_False.h5'.format(slide_id, patch_args.overlap))
+                        print('found heatmap for whole slide')
+                        save_path = save_path_full
+                    else:
+                        continue
+                
+            with h5py.File(save_path, 'r') as file:
+                file = h5py.File(save_path, 'r')
+                dset = file['attention_scores']
+                coord_dset = file['coords']
+                scores = dset[:]
+                coords = coord_dset[:]
+
+            heatmap_vis_args = {'convert_to_percentiles': True, 'vis_level': heatmap_args.vis_level, 'blur': heatmap_args.blur, 'custom_downsample': heatmap_args.custom_downsample}
+            if heatmap_args.use_ref_scores:
+                heatmap_vis_args['convert_to_percentiles'] = False
+
+                # heatmap_save_name = '{}_{}_roi_{}_blur_{}_rs_{}_bc_{}_a_{}_l_{}_bi_{}_{}.{}'.format(slide_id, float(patch_args.overlap), int(heatmap_args.use_roi),
+                #                                                                                 int(heatmap_args.blur), 
+                #                                                                                 int(heatmap_args.use_ref_scores), int(heatmap_args.blank_canvas), 
+                #                                                                                 float(heatmap_args.alpha), int(heatmap_args.vis_level), 
+                #                                                                                 int(heatmap_args.binarize), float(heatmap_args.binary_thresh), heatmap_args.save_ext)
+
+                heatmap_save_name = f"{slide_id}_heatmap.{heatmap_args.save_ext}"
+            
+            
+
+
+            if os.path.isfile(os.path.join(p_slide_save_dir, heatmap_save_name)):
+                pass
+                
+            else:                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
+                heatmap = drawHeatmap(scores, coords, slide_path, wsi_object=wsi_object,  
+                                    cmap=heatmap_args.cmap, alpha=heatmap_args.alpha, **heatmap_vis_args, 
+                                    binarize=heatmap_args.binarize, 
+                                        blank_canvas=heatmap_args.blank_canvas,
+                                        thresh=heatmap_args.binary_thresh,  patch_size = vis_patch_size,
+                                        overlap=patch_args.overlap, 
+                                        top_left=top_left, bot_right = bot_right)
+                if heatmap_args.save_ext == 'jpg':
+                    heatmap.save(os.path.join(p_slide_save_dir, heatmap_save_name), quality=90)
+
+                   
+                else:
+                    heatmap.save(os.path.join(p_slide_save_dir, heatmap_save_name))
+                    
+                
+            if heatmap_args.save_orig:
+                logger.info(f"Saving original WSI visualization for slide {slide_name}")
+                if heatmap_args.vis_level >= 0:
+                    vis_level = heatmap_args.vis_level
+                else:
+                    vis_level = vis_params['vis_level']
+                heatmap_save_name = '{}_orig_{}.{}'.format(slide_id,int(vis_level), heatmap_args.save_ext)
+                if os.path.isfile(os.path.join(p_slide_save_dir, heatmap_save_name)):
+                    pass
+                else:
+                    heatmap = wsi_object.visWSI(vis_level=vis_level, view_slide_only=True, custom_downsample=heatmap_args.custom_downsample)
+                    if heatmap_args.save_ext == 'jpg':
+                        heatmap.save(os.path.join(p_slide_save_dir, heatmap_save_name), quality=90)
+                    else:
+                        heatmap.save(os.path.join(p_slide_save_dir, heatmap_save_name))
+                        logger.info("Original WSI visualization saved")
+            logger.info(f"Completed processing slide {i+1}/{total}: {slide_name}")
+        config_save_path = os.path.join(exp_args.raw_save_dir, slide_id, 'config.yaml')
+        os.makedirs(os.path.dirname(config_save_path), exist_ok=True)
+        with open(config_save_path, 'w') as outfile:
+            yaml.dump(config_dict, outfile, default_flow_style=False)
+        
+
+
+        logger.info("\nAll processing completed successfully!")
+        return {
+                'status': 'success',
+                'message': 'Heatmap generated successfully',
+                'production_path': os.path.join(production_save_dir, heatmap_save_name),
+                'raw_path': os.path.join(raw_save_dir, heatmap_save_name)
+            }
+    
+    except Exception as e:
+        logger.error(f"Error generating heatmap: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            'status': 'error',
+            'message': f'Error generating heatmap: {str(e)}'
+        }
+    
+# def process_queue():
+#     logger.info("Starting slide processor...")
+    
+#     try:
+#         # Keep process alive to maintain model in memory
+#         while True:
+#             pass  # Process stays active, waiting for Flask to trigger slide processing
+            
+#     except KeyboardInterrupt:
+#         logger.info("\nStopping slide processor...")
+#         sys.exit(0)
+
+
+
+
+
+
+
+# def process_slide(image_path, flask_root_dir):
+#     try:
+#         # 1. Initial Setup
+#         slide_name = os.path.basename(image_path)
+#         slides = [slide_name]
+#         slide_id = slide_name.replace('.svs', '')
+#         patch_size = (256, 256)
+
+#         # Determine which CSV preset to use
+#         # if "TCGA" in slide_id:
+#         #     preset_name = 'tcga.csv'
+#         # elif "resection" in slide_id.lower():
+#         #     preset_name = 'bwh_resection.csv'
+#         # else:  # Default for biopsies
+        
+        
+        
+#         # 2. Configuration Setup
+#         clam_dir = os.path.join(flask_root_dir, 'model', 'CLAM_UNI_V2_211sld')
+
+#         preset_name = 'bwh_biopsy.csv'
+#         preset_path = os.path.join(clam_dir, 'presets', preset_name)
+#         preset_df = pd.read_csv(preset_path).iloc[0]  # ADD THIS MISSING LINE
+        
+#         # Create args namespace for parse_config_dict
+#         args = argparse.Namespace()
+#         args.save_exp_code = 'HEATMAP_OUTPUT'
+#         args.overlap = 0.5  # Matching your config
+#         args.config_file = "config_template.yaml"
+
+#         # Load and parse configuration
+#         config_path = os.path.join(clam_dir, 'heatmaps', 'configs', 'config_template.yaml')
+#         if not os.path.exists(config_path):
+#             raise FileNotFoundError(f"Config file not found at: {config_path}")
+            
+#         with open(config_path, 'r') as file:
+#             config_dict = yaml.safe_load(file)
+
+#         # Update paths in config to use Flask directories
+#         config_dict['exp_arguments'].update({
+#             'raw_save_dir': os.path.join(flask_root_dir, 'slides', 'raw_results'),
+#             'production_save_dir': os.path.join(flask_root_dir, 'slides', 'production_results'),
+#             'batch_size': 256,  # Matching your config
+#             'n_classes': 2
+#         })
+
+#         config_dict['data_arguments'].update({
+#             'data_dir': os.path.dirname(image_path),
+#             'slide_ext': '.svs',
+#             'label_dict': {'nm': 0, 'm': 1}  # Matching your config
+#         })
+
+#         # Parse config with updated paths
+#         config_dict = parse_config_dict(args, config_dict)
+
+#         # Convert dictionary sections to Namespace objects with your specific parameters
+#         patch_args = argparse.Namespace(
+#             patch_size=256,
+#             overlap=0.5,
+#             patch_level=0,
+#             custom_downsample=1
+#         )
+
+#         encoder_args = argparse.Namespace(
+#             model_name='uni_v1',  # Your specific encoder
+#             target_img_size=224   # Your specific target size
+#         )
+
+#         model_args = argparse.Namespace(
+#             ckpt_path=os.path.join(clam_dir, 'heatmaps', 'demo', 'ckpts', 's_4_checkpoint.pt'),
+#             model_type='clam_sb',
+#             initiate_fn='initiate_model',
+#             model_size='small',
+#             drop_out=0.0,
+#             embed_dim=1024,
+#             n_classes=2
+#         )
+
+#         heatmap_args = argparse.Namespace(
+#             vis_level=1,
+#             alpha=0.4,
+#             blank_canvas=False,
+#             save_orig=True,
+#             save_ext='jpg',
+#             use_ref_scores=True,
+#             blur=False,
+#             use_center_shift=True,
+#             use_roi=False,
+#             calc_heatmap=True,
+#             binarize=False,
+#             binary_thresh=-1,
+#             custom_downsample=1,
+#             cmap='jet'
+#         )
+
+#         exp_args = argparse.Namespace(
+#             n_classes=2,
+#             save_exp_code='HEATMAP_OUTPUT',
+#             raw_save_dir=config_dict['exp_arguments']['raw_save_dir'],
+#             production_save_dir=config_dict['exp_arguments']['production_save_dir'],
+#             batch_size=256
+#         )
+
+#         data_args = argparse.Namespace(
+#             data_dir=config_dict['data_arguments']['data_dir'],
+#             data_dir_key='source',
+#             process_list=None,  # We're processing a single slide
+#             preset='presets/bwh_biopsy.csv',
+#             slide_ext='.svs',
+#             label_dict={'nm': 0, 'm': 1}
+#         )
+
+        
+       
+#         # Log configuration details
+#         logger.info("Configuration loaded successfully")
+#         logger.info(f"Patch arguments: {vars(patch_args)}")
+#         logger.info(f"Model arguments: {vars(model_args)}")
+#         logger.info(f"Encoder arguments: {vars(encoder_args)}")
+#         logger.info(f"Experiment arguments: {vars(exp_args)}")
+#         logger.info(f"Heatmap arguments: {vars(heatmap_args)}")
+
+#         # 3. Directory Setup
+#         raw_save_dir = os.path.join(flask_root_dir, 'slides', 'raw_results', 
+#                                    exp_args.save_exp_code, slide_id)
+#         production_save_dir = os.path.join(flask_root_dir, 'slides', 'production_results', 
+#                                          exp_args.save_exp_code)
+#         os.makedirs(raw_save_dir, exist_ok=True)
+#         os.makedirs(production_save_dir, exist_ok=True)
+#         logger.info(f"Creating raw save directory: {raw_save_dir}")
+#         logger.info(f"Creating production save directory: {production_save_dir}")
+
+#         # 4. CUDA Setup
+#         if not torch.cuda.is_available():
+#             raise RuntimeError('CUDA is not available')
+#         torch.cuda.set_device(0)
+#         device = torch.device('cuda:0')
+#         logger.info(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+
+#         # 5. WSI analysis and segmentation
+#         # First, create a WSI object without segmentation to check properties
+#         wsi_object = WholeSlideImage(image_path)
+#         logger.info(f"WSI dimensions by level: {wsi_object.level_dim}")
+#         logger.info(f"Number of levels: {len(wsi_object.level_dim)}")
+
+
+#          # Try to read and analyze a region to understand image characteristics
+#         level = len(wsi_object.level_dim) - 1  # Use lowest resolution
+#         region = wsi_object.wsi.read_region((0,0), level, wsi_object.level_dim[level])
+#         region = np.array(region.convert('RGB'))
+
+        
+#         # preset = data_args.preset
+        
+#         # 6. Segmentation Parameters
+#         def_seg_params = {
+#             'seg_level': -1,   # Auto-select level
+#             'sthresh': 15,     # Saturation threshold
+#             'mthresh': 11,     # Morphological threshold
+#             'close': 2,        # Closing kernel size
+#             'use_otsu': False, # Disable Otsu thresholding
+#             'keep_ids': 'none', 
+#             'exclude_ids': 'none'
+# }
+
+#         def_filter_params = {
+#             'a_t': 50.0,        # Area threshold (1 mm²)
+#             'a_h': 8.0,        # Hole area threshold
+#             'max_n_holes': 10   # Max allowed holes
+# }
+
+#         def_vis_params = {
+#             'vis_level': -1,   # Auto-select visualization level
+#             'line_thickness': 250 # Contour line thickness
+#         }
+
+#         def_patch_params = {
+#             'use_padding': True,  # Pad patches
+#             'contour_fn': 'four_pt' # Contour detection method
+#         }
+
+#         # # Load corresponding CSV preset
+#         # if preset is not None:
+#         #     preset_df = pd.read_csv(preset)
+#         #     for key in def_seg_params.keys():
+#         #         def_seg_params[key] = preset_df.loc[0, key]
+
+#         #     for key in def_filter_params.keys():
+#         #         def_filter_params[key] = preset_df.loc[0, key]
+
+#         #     for key in def_vis_params.keys():
+#         #         def_vis_params[key] = preset_df.loc[0, key]
+
+#         #     for key in def_patch_params.keys():
+#         #         def_patch_params[key] = preset_df.loc[0, key]
+
+
+#         mean_intensity = np.mean(region)
+#         std_intensity = np.std(region)
+        
+#         logger.info(f"Image statistics at level {level}:")
+#         logger.info(f"Mean intensity: {mean_intensity}")
+#         logger.info(f"Std intensity: {std_intensity}")
+
+       
+
+#         def_seg_params = load_params(preset_df, def_seg_params)  # Only seg-level params
+#         def_filter_params = load_params(preset_df, def_filter_params)  # Only a_t, a_h, max_n_holes
+#         def_vis_params = load_params(preset_df, def_vis_params)  # Only vis_level and line_thickness
+#         def_patch_params = load_params(preset_df, def_patch_params)  # Only use_padding and contour_fn
+
+#          # Calculate and log image statistics
+        
+
+       
+
+#         logger.info(f"Adjusted parameters for pale image: sthresh={def_seg_params['sthresh']}, mthresh={def_seg_params['mthresh']}")
+
+
+#         # Initialize DataFrame with CSV parameters
+#         df = initialize_df(
+#             slides=slides,
+#             seg_params=def_seg_params,    # Now contains scalar values
+#             filter_params=def_filter_params,
+#             vis_params=def_vis_params,
+#             patch_params=def_patch_params,
+#             use_heatmap_args=True
+#         )
+
+        
+
+
+#         # Save parameters for audit trail
+#         df.to_csv(os.path.join(raw_save_dir, f'{slide_id}_params.csv'), index=False)
+#         logger.info(f"Saved processing parameters to: {slide_id}_params.csv")
+        
+#         logger.info(f"Initialized parameters DataFrame for slide: {slide_name}")
+
+#         # 7. Initialize WSI with Segmentation (This performs the segmentation)
+#         mask_file = os.path.join(raw_save_dir, f'{slide_id}_mask.pkl')
+
+#         logger.info("Starting tissue segmentation with modified parameters:")
+#         logger.info(f"Seg params: {def_seg_params}")
+#         logger.info(f"Filter params: {def_filter_params}")
+       
+
+
+#         # Initialize WSI with segmentation (This performs the segmentation)
+#         wsi_object = initialize_wsi(
+#             image_path,
+#             seg_mask_path=mask_file,
+#             seg_params=def_seg_params,  # Load from df,
+#             filter_params=def_filter_params
+#         )
+
+
+
+#         mask = wsi_object.visWSI(**def_vis_params, number_contours=True)
+#         mask_path = os.path.join(raw_save_dir, f'{slide_id}_mask.jpg')
+#         mask.save(mask_path)
+#         logger.info(f"Saved segmentation visualization at: {mask_path}")
+       
+#         # 8. Verify Segmentation Results (maintaining previous check structure)
+#         if not hasattr(wsi_object, 'contours_tissue'):
+#             raise ValueError("Tissue segmentation failed - no contours_tissue attribute")
+        
+#         n_contours = len(wsi_object.contours_tissue)
+#         logger.info(f"Found {n_contours} tissue contours")
+        
+#         if n_contours == 0:
+
+#              # First retry with Otsu thresholding
+#             logger.warning("First segmentation attempt failed. Retrying with Otsu thresholding and adjusted parameters...")
+
+#             # Remove previous mask file
+#             if os.path.exists(mask_file):
+#                 os.remove(mask_file)
+#             # Update segmentation parameters for retry
+#             def_seg_params.update({
+#                'use_otsu': True,
+#                 'sthresh': 5,
+#                 'mthresh': 3,
+#                 'close': 6
+#             })
+            
+
+#             # # Re-run segmentation
+#             wsi_object = initialize_wsi(
+#                 image_path,
+#                 seg_mask_path=mask_file,
+#                 seg_params=def_seg_params,
+#                 filter_params=def_filter_params,
+#             )
+
+#             # Check segmentation again after retry
+#             if not hasattr(wsi_object, 'contours_tissue') or len(wsi_object.contours_tissue) == 0:
+#                 thumb_path = os.path.join(raw_save_dir, f'{slide_id}_thumb.png')
+#                 thumb_size = 1024
+#                 thumb_level = wsi_object.wsi.get_best_level_for_downsample(
+#                   wsi_object.level_dim[0][0] / thumb_size)
+#                 thumb = wsi_object.wsi.read_region(
+#                         (0,0), thumb_level, 
+#                      wsi_object.level_dim[thumb_level]).convert('RGB')
+#                 thumb.save(thumb_path)  # Save thumbnail for debugging
+#                 raise ValueError(f"No tissue regions found after retry. Check: {thumb_path}")
+#             # thumb_size = 1024
+#             # thumb_level = wsi_object.wsi.get_best_level_for_downsample(
+#             #     wsi_object.level_dim[0][0] / thumb_size)
+#             # thumb = wsi_object.wsi.read_region(
+#             #     (0,0), thumb_level, 
+#             #     wsi_object.level_dim[thumb_level]).convert('RGB')
+#             # thumb_path = os.path.join(raw_save_dir, f'{slide_id}_thumb.png')
+#             # thumb.save(thumb_path)
+#             # logger.info(f"Saved thumbnail for debugging at: {thumb_path}")
+#             # raise ValueError(f"No tissue regions found. Check {thumb_path}")
+#         mask_vis = wsi_object.visWSI(**def_vis_params, number_contours=True)
+#         mask_vis.save(os.path.join(raw_save_dir, f'{slide_id}_seg_debug.jpg'))
+#         logger.info(f"Saved segmentation debug visualization")
+        
+
+#         # 10. Save the segmentation
+#         wsi_object.saveSegmentation(mask_file)
+#         logger.info(f"Saved segmentation to: {mask_file}")
+
+#         # 9. Model and Feature Extractor Setup
+#         clam_dir = os.path.join(flask_root_dir, 'model', 'CLAM_UNI_V2_211sld')
+#         ckpt_path = os.path.join(clam_dir, 'heatmaps', 'demo', 'ckpts', 's_4_checkpoint.pt')
+        
+#         model = initiate_model(model_args, ckpt_path)
+#         model = model.to(device)
+#         logger.info("Model initialized and moved to GPU")
+
+#         feature_extractor, img_transforms = get_encoder(encoder_args.model_name, 
+#                                                       target_img_size=encoder_args.target_img_size)
+
+#         # 9. Feature Computation
+#         h5_path = os.path.join(raw_save_dir, f'{slide_id}.h5')
+#         features_path = os.path.join(raw_save_dir, f'{slide_id}.pt')
+
+#         if not os.path.isfile(h5_path):
+#             wsi_kwargs = {
+#                 'top_left': None,
+#                 'bot_right': None,
+#                 'patch_size': patch_size,
+#                 'step_size': patch_size,
+#                 'custom_downsample': patch_args.custom_downsample,
+#                 'level': patch_args.patch_level,
+#                 'use_center_shift': heatmap_args.use_center_shift
+#             }
+            
+#             logger.info(f'Computing features for {slide_id}')
+#             logger.info(f"WSI kwargs: {wsi_kwargs}")
+
+#             try:
+#                 _, _, wsi_object = compute_from_patches(
+#                     wsi_object=wsi_object,
+#                     model=model,
+#                     feature_extractor=feature_extractor,
+#                     img_transforms=img_transforms,
+#                     batch_size=exp_args.batch_size,
+#                     attn_save_path=None,
+#                     feat_save_path=h5_path,
+#                     ref_scores=None,
+#                     **wsi_kwargs,
+#                 )
+#                 logger.info("Features computed successfully")
+#             except Exception as e:
+#                 logger.error(f"Error in compute_from_patches: {str(e)}")
+#                 logger.error(f"Traceback: {traceback.format_exc()}")
+#                 raise
+#             if not os.path.isfile(features_path):
+#                 with h5py.File(h5_path, "r") as file:
+#                     features = torch.tensor(file['features'][:])
+#                     torch.save(features, features_path)
+#                     logger.info(f"Features saved to {features_path}")
+
+#             # 11. Load Features and Generate Predictions
+#             logger.info('Generating predictions...')
+#             features = torch.load(features_path)
+#             logger.info(f"Features loaded successfully. Shape: {features.shape}")
+
+#             # Setup label dictionary
+#             label_dict = data_args.label_dict
+#             class_labels = list(label_dict.keys())
+#             class_encodings = list(label_dict.values())
+#             reverse_label_dict = {class_encodings[i]: class_labels[i] for i in range(len(class_labels))}
+
+#             # Generate predictions
+#             Y_hats, Y_hats_str, Y_probs, A = infer_single_slide(
+#                 model=model,
+#                 device=device,
+#                 features=features,
+#                 label='Unspecified', 
+#                reverse_label_dict=reverse_label_dict,
+#                 n_classes=exp_args.n_classes
+#             )
+#             logger.info(f"Predictions generated: {Y_hats_str[0]} with probability {Y_probs[0]:.4f}")
+
+#             # Save attention scores for heatmap generation
+#             if A is not None:
+#                 with h5py.File(h5_path, 'r') as file:
+#                     coords = file['coords'][:]
+                
+#                 asset_dict = {
+#                     'attention_scores': A,
+#                     'coords': coords
+#                 }
+#                 save_hdf5(os.path.join(raw_save_dir, f'{slide_id}_attention.h5'), asset_dict)
+
+#             # 12. Generate Heatmap
+#             logger.info('Generating heatmap...')
+#             heatmap_save_path = os.path.join(production_save_dir, f'{slide_id}_heatmap.{heatmap_args.save_ext}')
+
+#             if not os.path.isfile(heatmap_save_path):
+#                 # Load attention scores and coordinates
+#                 with h5py.File(h5_path, 'r') as file:
+#                     scores = file['attention_scores'][:]
+#                     coords = file['coords'][:]
+
+#                 # Create heatmap
+#                 if heatmap_args.calc_heatmap:
+#                     heatmap = drawHeatmap(
+#                         scores, 
+#                         coords, 
+#                         image_path,
+#                         wsi_object=wsi_object,
+#                         cmap=heatmap_args.cmap,
+#                         alpha=heatmap_args.alpha,
+#                         use_holes=True,
+#                         binarize=heatmap_args.binarize,
+#                         vis_level=heatmap_args.vis_level,
+#                         blank_canvas=heatmap_args.blank_canvas,
+#                         thresh=heatmap_args.binary_thresh,
+#                         patch_size=patch_size,
+#                         overlap=patch_args.overlap
+#                     )
+
+#                 # Save heatmap with appropriate quality
+#                     if heatmap_args.save_ext == 'jpg':
+#                         heatmap.save(heatmap_save_path, quality=100)
+#                     else:
+#                         heatmap.save(heatmap_save_path)
+#                 logger.info(f"Heatmap saved to {heatmap_save_path}")
+
+#             # 13. Cleanup
+#             if os.path.exists(h5_path) and os.path.exists(features_path):
+#                 os.remove(h5_path)  # Remove temporary H5 file
+#                 logger.info("Removed temporary H5 file")
+                
+#             torch.cuda.empty_cache()  # Clear GPU memory
+#             logger.info("Cleared GPU memory")
+
+#             # 14. Return Results
+#             logger.info('Processing completed successfully')
+#             return {
+#                 'status': 'success',
+#                 'message': 'Slide processed successfully',
+#                 'predictions': {
+#                     'label': Y_hats_str[0],
+#                     'probability': float(Y_probs[0])
+#                 },
+#                 'heatmap_path': heatmap_save_path
+#             }
+
+#     except Exception as e:
+#         logger.error(f"Error processing slide: {str(e)}")
+#         logger.error(f"Error traceback: {traceback.format_exc()}")
+#         return {
+#             'status': 'error',
+#             'message': f'Error during processing: {str(e)}'
+#         }
+    
+# def process_queue():
+#     logger.info("Slide processor is running. Waiting for slides...")
+    
+#     while True:
+#         try:
+#             if not slide_queue.empty():
+#                 image_path, flask_root_dir = slide_queue.get()
+#                 logger.info(f"Processing slide from queue: {image_path}")
+#                 result = process_slide(image_path, flask_root_dir)
+#                 logger.info(f"Processing result: {result}")
+#             else:
+#                 time.sleep(1)
+                
+#         except Exception as e:
+#             logger.error(f"Error in queue processing: {str(e)}")
+#             time.sleep(1)
+
+
+# def infer_single_slide(model, device, features, label, reverse_label_dict, k=1):
+
+#     features = features.to(device)
+
+#     with torch.inference_mode():
+#         # Get model predictions
+#         logits, Y_prob, Y_hat, A, _ = model(features)
+#         Y_hat = Y_hat.item()
+
+#         # Handle attention weights
+#         if isinstance(model, CLAM_MB):
+#             A = A[Y_hat]  # For multi-branch, get attention for predicted class
+
+#         A = A.view(-1, 1).cpu().numpy()
+
+#         # Get top k predictions
+#         probs, ids = torch.topk(Y_prob, n_classes)
+#         probs = probs[-1].cpu().numpy()
+#         ids = ids[-1].cpu().numpy()
+
+#         # Convert to string labels
+#         preds_str = np.array([reverse_label_dict[idx] for idx in ids])
+
+#         logger.info(f'Y_hat: {reverse_label_dict[Y_hat]}, Y: {label}, Y_prob: {[f"{p:.4f}" for p in Y_prob.cpu().flatten()]}')
+       
+#     return ids, preds_str, probs, A
+
+
+
+# def load_params(df_entry, params):
+
+#     for key in params.keys():
+#         if key in df_entry.index:
+#             dtype = type(params[key])
+#             val = df_entry[key] 
+#             val = dtype(val)
+#             if isinstance(val, str):
+#                 if len(val) > 0:
+#                     params[key] = val
+#             elif not np.isnan(val):
+#                 params[key] = val
+
+#     return params
+
+
+# def parse_config_dict(args, config_dict):
+ 
+#     if args.save_exp_code is not None:
+#         config_dict['exp_arguments']['save_exp_code'] = args.save_exp_code
+#     if args.overlap is not None:
+#         config_dict['patching_arguments']['overlap'] = args.overlap
+#     return config_dict
+
+# # Keep the original command-line execution logic
+#     # This will only run when the script is executed directly
+# def run_legacy_processing():
+#     # Contains all the original script's block logic
+#     parser = argparse.ArgumentParser(description='Heatmap inference script')
+#     parser.add_argument('--save_exp_code', type=str, default=None,
+#                         help='experiment code')
+#     parser.add_argument('--overlap', type=float, default=None)
+#     parser.add_argument('--config_file', type=str, default="heatmap_config_template.yaml")
+#     args = parser.parse_args()
+#     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#     def infer_single_slide(model, features, label, reverse_label_dict, k=1):
+#         features = features.to(device)
+#         with torch.inference_mode():
+#             if isinstance(model, (CLAM_SB, CLAM_MB)):
+#                 model_results_dict = model(features)
+#                 logits, Y_prob, Y_hat, A, _ = model(features)
+#                 Y_hat = Y_hat.item()
+
+#                 if isinstance(model, (CLAM_MB,)):
+#                     A = A[Y_hat]
+
+#                 A = A.view(-1, 1).cpu().numpy()
+
+#             else:
+#                 raise NotImplementedError
+
+#             print('Y_hat: {}, Y: {}, Y_prob: {}'.format(reverse_label_dict[Y_hat], label, ["{:.4f}".format(p) for p in Y_prob.cpu().flatten()]))	
+            
+#             probs, ids = torch.topk(Y_prob, k)
+#             probs = probs[-1].cpu().numpy()
+#             ids = ids[-1].cpu().numpy()
+#             preds_str = np.array([reverse_label_dict[idx] for idx in ids])
+
+#         return ids, preds_str, probs, A
+
+#     def load_params(df_entry, params):
+#         for key in params.keys():
+#             if key in df_entry.index:
+#                 dtype = type(params[key])
+#                 val = df_entry[key] 
+#                 val = dtype(val)
+#                 if isinstance(val, str):
+#                     if len(val) > 0:
+#                         params[key] = val
+#                 elif not np.isnan(val):
+#                     params[key] = val
+#                 else:
+#                     pdb.set_trace()
+
+#         return params
+
+#     def parse_config_dict(args, config_dict):
+#         if args.save_exp_code is not None:
+#             config_dict['exp_arguments']['save_exp_code'] = args.save_exp_code
+#         if args.overlap is not None:
+#             config_dict['patching_arguments']['overlap'] = args.overlap
+#         return config_dict
+
+#     if __name__ == '__main__':
+#         config_path = os.path.join('heatmaps/configs', args.config_file)
+#         config_dict = yaml.safe_load(open(config_path, 'r'))
+#         config_dict = parse_config_dict(args, config_dict)
+
+#         for key, value in config_dict.items():
+#             if isinstance(value, dict):
+#                 print('\n'+key)
+#                 for value_key, value_value in value.items():
+#                     print (value_key + " : " + str(value_value))
+#             else:
+#                 print ('\n'+key + " : " + str(value))
+                
+#         decision = input('Continue? Y/N ')
+#         if decision in ['Y', 'y', 'Yes', 'yes']:
+#             pass
+#         elif decision in ['N', 'n', 'No', 'NO']:
+#             exit()
+#         else:
+#             raise NotImplementedError
+
+#         args = config_dict
+#         patch_args = argparse.Namespace(**args['patching_arguments'])
+#         data_args = argparse.Namespace(**args['data_arguments'])
+#         model_args = args['model_arguments']
+#         model_args.update({'n_classes': args['exp_arguments']['n_classes']})
+#         model_args = argparse.Namespace(**model_args)
+#         encoder_args = args['encoder_arguments']
+#         encoder_args = argparse.Namespace(**encoder_args)
+#         exp_args = argparse.Namespace(**args['exp_arguments'])
+#         heatmap_args = argparse.Namespace(**args['heatmap_arguments'])
+#         sample_args = argparse.Namespace(**args['sample_arguments'])
+        
+#         patch_size = tuple([patch_args.patch_size for i in range(2)])
+#         step_size = tuple((np.array(patch_size) * (1 - patch_args.overlap)).astype(int))
+#         print('patch_size: {} x {}, with {:.2f} overlap, step size is {} x {}'.format(patch_size[0], patch_size[1], patch_args.overlap, step_size[0], step_size[1]))
+
+#         preset = data_args.preset
+#         def_seg_params = {'seg_level': -1, 'sthresh': 15, 'mthresh': 11, 'close': 2, 'use_otsu': False, 
+#                         'keep_ids': 'none', 'exclude_ids':'none'}
+#         def_filter_params = {'a_t':50.0, 'a_h': 8.0, 'max_n_holes':10}
+#         def_vis_params = {'vis_level': -1, 'line_thickness': 250}
+#         def_patch_params = {'use_padding': True, 'contour_fn': 'four_pt'}
+
+#         if preset is not None:
+#             preset_df = pd.read_csv(preset)
+#             for key in def_seg_params.keys():
+#                 def_seg_params[key] = preset_df.loc[0, key]
+
+#             for key in def_filter_params.keys():
+#                 def_filter_params[key] = preset_df.loc[0, key]
+
+#             for key in def_vis_params.keys():
+#                 def_vis_params[key] = preset_df.loc[0, key]
+
+#             for key in def_patch_params.keys():
+#                 def_patch_params[key] = preset_df.loc[0, key]
+
+
+#         if data_args.process_list is None:
+#             if isinstance(data_args.data_dir, list):
+#                 slides = []
+#                 for data_dir in data_args.data_dir:
+#                     slides.extend(os.listdir(data_dir))
+#             else:
+#                 slides = sorted(os.listdir(data_args.data_dir))
+#             slides = [slide for slide in slides if data_args.slide_ext in slide]
+#             df = initialize_df(slides, def_seg_params, def_filter_params, def_vis_params, def_patch_params, use_heatmap_args=False)
+            
+#         else:
+#             df = pd.read_csv(os.path.join('heatmaps/process_lists', data_args.process_list))
+#             df = initialize_df(df, def_seg_params, def_filter_params, def_vis_params, def_patch_params, use_heatmap_args=False)
+
+#         mask = df['process'] == 1
+#         process_stack = df[mask].reset_index(drop=True)
+#         total = len(process_stack)
+#         print('\nlist of slides to process: ')
+#         print(process_stack.head(len(process_stack)))
+
+#         print('\ninitializing model from checkpoint')
+#         ckpt_path = model_args.ckpt_path
+#         print('\nckpt path: {}'.format(ckpt_path))
+        
+#         if model_args.initiate_fn == 'initiate_model':
+#             model =  initiate_model(model_args, ckpt_path)
+#         else:
+#             raise NotImplementedError
+
+#         feature_extractor, img_transforms = get_encoder(encoder_args.model_name, target_img_size=encoder_args.target_img_size)
+#         _ = feature_extractor.eval()
+#         feature_extractor = feature_extractor.to(device)
+#         print('Done!')
+
+#         label_dict =  data_args.label_dict
+#         class_labels = list(label_dict.keys())
+#         class_encodings = list(label_dict.values())
+#         reverse_label_dict = {class_encodings[i]: class_labels[i] for i in range(len(class_labels))} 
+        
+
+#         os.makedirs(exp_args.production_save_dir, exist_ok=True)
+#         os.makedirs(exp_args.raw_save_dir, exist_ok=True)
+#         blocky_wsi_kwargs = {'top_left': None, 'bot_right': None, 'patch_size': patch_size, 'step_size': patch_size, 
+#         'custom_downsample':patch_args.custom_downsample, 'level': patch_args.patch_level, 'use_center_shift': heatmap_args.use_center_shift}
+
+#         for i in tqdm(range(len(process_stack))):
+#             slide_name = process_stack.loc[i, 'slide_id']
+#             if data_args.slide_ext not in slide_name:
+#                 slide_name+=data_args.slide_ext
+#             print('\nprocessing: ', slide_name)	
+
+#             try:
+#                 label = process_stack.loc[i, 'label']
+#             except KeyError:
+#                 label = 'Unspecified'
+
+#             slide_id = slide_name.replace(data_args.slide_ext, '')
+
+#             if not isinstance(label, str):
+#                 grouping = reverse_label_dict[label]
+#             else:
+#                 grouping = label
+
+#             p_slide_save_dir = os.path.join(exp_args.production_save_dir, exp_args.save_exp_code, str(grouping))
+#             os.makedirs(p_slide_save_dir, exist_ok=True)
+
+#             r_slide_save_dir = os.path.join(exp_args.raw_save_dir, exp_args.save_exp_code, str(grouping),  slide_id)
+#             os.makedirs(r_slide_save_dir, exist_ok=True)
+
+#             if heatmap_args.use_roi:
+#                 x1, x2 = process_stack.loc[i, 'x1'], process_stack.loc[i, 'x2']
+#                 y1, y2 = process_stack.loc[i, 'y1'], process_stack.loc[i, 'y2']
+#                 top_left = (int(x1), int(y1))
+#                 bot_right = (int(x2), int(y2))
+#             else:
+#                 top_left = None
+#                 bot_right = None
+            
+#             print('slide id: ', slide_id)
+#             print('top left: ', top_left, ' bot right: ', bot_right)
+
+#             if isinstance(data_args.data_dir, str):
+#                 slide_path = os.path.join(data_args.data_dir, slide_name)
+#             elif isinstance(data_args.data_dir, dict):
+#                 data_dir_key = process_stack.loc[i, data_args.data_dir_key]
+#                 slide_path = os.path.join(data_args.data_dir[data_dir_key], slide_name)
+#             else:
+#                 raise NotImplementedError
+
+#             mask_file = os.path.join(r_slide_save_dir, slide_id+'_mask.pkl')
+            
+#             # Load segmentation and filter parameters
+#             seg_params = def_seg_params.copy()
+#             filter_params = def_filter_params.copy()
+#             vis_params = def_vis_params.copy()
+
+#             seg_params = load_params(process_stack.loc[i], seg_params)
+#             filter_params = load_params(process_stack.loc[i], filter_params)
+#             vis_params = load_params(process_stack.loc[i], vis_params)
+
+#             keep_ids = str(seg_params['keep_ids'])
+#             if len(keep_ids) > 0 and keep_ids != 'none':
+#                 seg_params['keep_ids'] = np.array(keep_ids.split(',')).astype(int)
+#             else:
+#                 seg_params['keep_ids'] = []
+
+#             exclude_ids = str(seg_params['exclude_ids'])
+#             if len(exclude_ids) > 0 and exclude_ids != 'none':
+#                 seg_params['exclude_ids'] = np.array(exclude_ids.split(',')).astype(int)
+#             else:
+#                 seg_params['exclude_ids'] = []
+
+#             for key, val in seg_params.items():
+#                 print('{}: {}'.format(key, val))
+
+#             for key, val in filter_params.items():
+#                 print('{}: {}'.format(key, val))
+
+#             for key, val in vis_params.items():
+#                 print('{}: {}'.format(key, val))
+            
+#             print('Initializing WSI object')
+#             wsi_object = initialize_wsi(slide_path, seg_mask_path=mask_file, seg_params=seg_params, filter_params=filter_params)
+#             print('Done!')
+
+#             wsi_ref_downsample = wsi_object.level_downsamples[patch_args.patch_level]
+
+#             # the actual patch size for heatmap visualization should be the patch size * downsample factor * custom downsample factor
+#             vis_patch_size = tuple((np.array(patch_size) * np.array(wsi_ref_downsample) * patch_args.custom_downsample).astype(int))
+
+#             block_map_save_path = os.path.join(r_slide_save_dir, '{}_blockmap.h5'.format(slide_id))
+#             mask_path = os.path.join(r_slide_save_dir, '{}_mask.jpg'.format(slide_id))
+#             if vis_params['vis_level'] < 0:
+#                 best_level = wsi_object.wsi.get_best_level_for_downsample(32)
+#                 vis_params['vis_level'] = best_level
+#             mask = wsi_object.visWSI(**vis_params, number_contours=True)
+#             mask.save(mask_path)
+            
+#             features_path = os.path.join(r_slide_save_dir, slide_id+'.pt')
+#             h5_path = os.path.join(r_slide_save_dir, slide_id+'.h5')
+        
+
+#             ##### check if h5_features_file exists ######
+#             if not os.path.isfile(h5_path) :
+#                 _, _, wsi_object = compute_from_patches(wsi_object=wsi_object, 
+#                                                 model=model, 
+#                                                 feature_extractor=feature_extractor, 
+#                                                 img_transforms=img_transforms,
+#                                                 batch_size=exp_args.batch_size, **blocky_wsi_kwargs, 
+#                                                 attn_save_path=None, feat_save_path=h5_path, 
+#                                                 ref_scores=None)				
+            
+#             ##### check if pt_features_file exists ######
+#             if not os.path.isfile(features_path):
+#                 file = h5py.File(h5_path, "r")
+#                 features = torch.tensor(file['features'][:])
+#                 torch.save(features, features_path)
+#                 file.close()
+
+#             # load features 
+#             features = torch.load(features_path)
+#             process_stack.loc[i, 'bag_size'] = len(features)
+            
+#             wsi_object.saveSegmentation(mask_file)
+#             Y_hats, Y_hats_str, Y_probs, A = infer_single_slide(model, features, label, reverse_label_dict, exp_args.n_classes)
+#             del features
+            
+#             if not os.path.isfile(block_map_save_path): 
+#                 file = h5py.File(h5_path, "r")
+#                 coords = file['coords'][:]
+#                 file.close()
+#                 asset_dict = {'attention_scores': A, 'coords': coords}
+#                 block_map_save_path = save_hdf5(block_map_save_path, asset_dict, mode='w')
+            
+#             # save top 3 predictions
+#             for c in range(exp_args.n_classes):
+#                 process_stack.loc[i, 'Pred_{}'.format(c)] = Y_hats_str[c]
+#                 process_stack.loc[i, 'p_{}'.format(c)] = Y_probs[c]
+
+#             os.makedirs('heatmaps/results/', exist_ok=True)
+#             if data_args.process_list is not None:
+#                 process_stack.to_csv('heatmaps/results/{}.csv'.format(data_args.process_list.replace('.csv', '')), index=False)
+#             else:
+#                 process_stack.to_csv('heatmaps/results/{}.csv'.format(exp_args.save_exp_code), index=False)
+            
+#             file = h5py.File(block_map_save_path, 'r')
+#             dset = file['attention_scores']
+#             coord_dset = file['coords']
+#             scores = dset[:]
+#             coords = coord_dset[:]
+#             file.close()
+
+#     # Heatmap directory
+#             samples = sample_args.samples
+#             for sample in samples:
+#                 if sample['sample']:
+#                     tag = "label_{}_pred_{}".format(label, Y_hats[0])
+#                     sample_save_dir =  os.path.join(exp_args.production_save_dir, exp_args.save_exp_code, 'sampled_patches', str(tag), sample['name'])
+#                     os.makedirs(sample_save_dir, exist_ok=True)
+#                     print('sampling {}'.format(sample['name']))
+#                     sample_results = sample_rois(scores, coords, k=sample['k'], mode=sample['mode'], seed=sample['seed'], 
+#                         score_start=sample.get('score_start', 0), score_end=sample.get('score_end', 1))
+#                     for idx, (s_coord, s_score) in enumerate(zip(sample_results['sampled_coords'], sample_results['sampled_scores'])):
+#                         print('coord: {} score: {:.3f}'.format(s_coord, s_score))
+#                         patch = wsi_object.wsi.read_region(tuple(s_coord), patch_args.patch_level, (patch_args.patch_size, patch_args.patch_size)).convert('RGB')
+#                         patch.save(os.path.join(sample_save_dir, '{}_{}_x_{}_y_{}_a_{:.3f}.png'.format(idx, slide_id, s_coord[0], s_coord[1], s_score)))
+
+#             wsi_kwargs = {'top_left': top_left, 'bot_right': bot_right, 'patch_size': patch_size, 'step_size': step_size, 
+#             'custom_downsample':patch_args.custom_downsample, 'level': patch_args.patch_level, 'use_center_shift': heatmap_args.use_center_shift}
+
+#             heatmap_save_name = '{}_blockmap.tiff'.format(slide_id)
+#             if os.path.isfile(os.path.join(r_slide_save_dir, heatmap_save_name)):
+#                 pass
+#             else:
+#                 heatmap = drawHeatmap(scores, coords, slide_path, wsi_object=wsi_object, cmap=heatmap_args.cmap, alpha=heatmap_args.alpha, use_holes=True, binarize=False, vis_level=-1, blank_canvas=False,
+#                                 thresh=-1, patch_size = vis_patch_size, convert_to_percentiles=True)
+            
+#                 heatmap.save(os.path.join(r_slide_save_dir, '{}_blockmap.png'.format(slide_id)))
+#                 del heatmap
+
+#             save_path = os.path.join(r_slide_save_dir, '{}_{}_roi_{}.h5'.format(slide_id, patch_args.overlap, heatmap_args.use_roi))
+
+#             if heatmap_args.use_ref_scores:
+#                 ref_scores = scores
+#             else:
+#                 ref_scores = None
+            
+#             if heatmap_args.calc_heatmap:
+#                 compute_from_patches(wsi_object=wsi_object, 
+#                                     img_transforms=img_transforms,
+#                                     clam_pred=Y_hats[0], model=model, 
+#                                     feature_extractor=feature_extractor, 
+#                                     batch_size=exp_args.batch_size, **wsi_kwargs, 
+#                                     attn_save_path=save_path,  ref_scores=ref_scores)
+
+#             if not os.path.isfile(save_path):
+#                 print('heatmap {} not found'.format(save_path))
+#                 if heatmap_args.use_roi:
+#                     save_path_full = os.path.join(r_slide_save_dir, '{}_{}_roi_False.h5'.format(slide_id, patch_args.overlap))
+#                     print('found heatmap for whole slide')
+#                     save_path = save_path_full
+#                 else:
+#                     continue
+            
+#             with h5py.File(save_path, 'r') as file:
+#                 file = h5py.File(save_path, 'r')
+#                 dset = file['attention_scores']
+#                 coord_dset = file['coords']
+#                 scores = dset[:]
+#                 coords = coord_dset[:]
+
+#             heatmap_vis_args = {'convert_to_percentiles': True, 'vis_level': heatmap_args.vis_level, 'blur': heatmap_args.blur, 'custom_downsample': heatmap_args.custom_downsample}
+#             if heatmap_args.use_ref_scores:
+#                 heatmap_vis_args['convert_to_percentiles'] = False
+
+#             heatmap_save_name = '{}_{}_roi_{}_blur_{}_rs_{}_bc_{}_a_{}_l_{}_bi_{}_{}.{}'.format(slide_id, float(patch_args.overlap), int(heatmap_args.use_roi),
+#                                                                                             int(heatmap_args.blur), 
+#                                                                                             int(heatmap_args.use_ref_scores), int(heatmap_args.blank_canvas), 
+#                                                                                             float(heatmap_args.alpha), int(heatmap_args.vis_level), 
+#                                                                                             int(heatmap_args.binarize), float(heatmap_args.binary_thresh), heatmap_args.save_ext)
+
+
+#             if os.path.isfile(os.path.join(p_slide_save_dir, heatmap_save_name)):
+#                 pass
+            
+#             else:                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
+#                 heatmap = drawHeatmap(scores, coords, slide_path, wsi_object=wsi_object,  
+#                                     cmap=heatmap_args.cmap, alpha=heatmap_args.alpha, **heatmap_vis_args, 
+#                                     binarize=heatmap_args.binarize, 
+#                                         blank_canvas=heatmap_args.blank_canvas,
+#                                         thresh=heatmap_args.binary_thresh,  patch_size = vis_patch_size,
+#                                         overlap=patch_args.overlap, 
+#                                         top_left=top_left, bot_right = bot_right)
+#                 if heatmap_args.save_ext == 'jpg':
+#                     heatmap.save(os.path.join(p_slide_save_dir, heatmap_save_name), quality=100)
+#                 else:
+#                     heatmap.save(os.path.join(p_slide_save_dir, heatmap_save_name))
+            
+#             if heatmap_args.save_orig:
+#                 if heatmap_args.vis_level >= 0:
+#                     vis_level = heatmap_args.vis_level
+#                 else:
+#                     vis_level = vis_params['vis_level']
+#                 heatmap_save_name = '{}_orig_{}.{}'.format(slide_id,int(vis_level), heatmap_args.save_ext)
+#                 if os.path.isfile(os.path.join(p_slide_save_dir, heatmap_save_name)):
+#                     pass
+#                 else:
+#                     heatmap = wsi_object.visWSI(vis_level=vis_level, view_slide_only=True, custom_downsample=heatmap_args.custom_downsample)
+#                     if heatmap_args.save_ext == 'jpg':
+#                         heatmap.save(os.path.join(p_slide_save_dir, heatmap_save_name), quality=100)
+#                     else:
+#                         heatmap.save(os.path.join(p_slide_save_dir, heatmap_save_name))
+
+#         with open(os.path.join(exp_args.raw_save_dir, exp_args.save_exp_code, 'config.yaml'), 'w') as outfile:
+#             yaml.dump(config_dict, outfile, default_flow_style=False)
+
+
+# if __name__ == '__main__':
+#     import sys
+
+#     if len(sys.argv) > 1 and sys.argv[1] == '--legacy':
+#         # For processing single slides
+#         run_legacy_processing()
+#     else:
+#          # Run in queue processing mode
+#         try:
+#             logger.info("Starting slide processor in queue mode")
+#             process_queue()
+#         except KeyboardInterrupt:
+#             logger.info("\nStopping slide processor...")
+#             sys.exit(0) 
+   
+
+
+

@@ -1,0 +1,26 @@
+{
+  "type": "Compass Connections",
+  "version": {
+    "$numberInt": "1"
+  },
+  "connections": [
+    {
+      "id": "04b1bac4-f844-4909-ac94-f70a9bc8a610",
+      "lastUsed": {
+        "$date": {
+          "$numberLong": "1735544679446"
+        }
+      },
+      "favorite": {
+        "name": "cluster0.i5mub.mongodb.net"
+      },
+      "savedConnectionType": "recent",
+      "connectionOptions": {
+        "connectionString": "mongodb+srv://admin:admin12@cluster0.i5mub.mongodb.net/",
+        "oidc": {
+          "serializedState": "eyJvaWRjUGx1Z2luU3RhdGVWZXJzaW9uIjowLCJzdGF0ZSI6W119"
+        }
+      }
+    }
+  ]
+}
